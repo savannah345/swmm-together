@@ -241,11 +241,13 @@ def rpc_create_user(conn, email: str, password: str) -> bool:
     try:
         set_rls_user(cur, None)
         qexec(cur, "select public.create_user(%s, %s);", (email, h))
+        row = cur.fetchone()
         cur.close()
-        return True
+        return bool(row and row[0])  # return function’s boolean
     except Exception:
         cur.close()
         return False
+
 
 def rpc_change_password(conn, user_id: str, new_password: str) -> bool:
     h = bcrypt_hash(new_password)
@@ -253,8 +255,9 @@ def rpc_change_password(conn, user_id: str, new_password: str) -> bool:
     try:
         set_rls_user(cur, user_id)
         qexec(cur, "select public.change_password(%s);", (h,))
+        row = cur.fetchone()
         cur.close()
-        return True
+        return bool(row and row[0])  # return function’s boolean
     except Exception:
         cur.close()
         return False
