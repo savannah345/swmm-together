@@ -140,13 +140,17 @@ def bcrypt_check(password: str, hashed: str) -> bool:
 
 import psycopg
 
+
 def get_conn():
     # Turn OFF server-side prepared statements; keep autocommit for PgBouncer
     # (If you’re on Supabase 6543 pooled port, this is the correct setting.)
-    return psycopg.connect(
+    conn = psycopg.connect(
         st.secrets["SUPABASE_DB_URL"],
         prepare_threshold=None
     )
+    conn.autocommit = True  # ← critical for pooled connections and to persist inserts/updates
+    return conn
+
 
 def try_get_conn():
     """Return a live connection or None; do NOT crash the page."""
@@ -243,7 +247,7 @@ def rpc_create_user(conn, email: str, password: str) -> bool:
         qexec(cur, "select public.create_user(%s, %s);", (email, h))
         row = cur.fetchone()
         cur.close()
-        return bool(row and row[0])  # return function’s boolean
+        return bool(row and row[0])  # success if a UUID was returned
     except Exception:
         cur.close()
         return False
@@ -255,9 +259,8 @@ def rpc_change_password(conn, user_id: str, new_password: str) -> bool:
     try:
         set_rls_user(cur, user_id)
         qexec(cur, "select public.change_password(%s);", (h,))
-        row = cur.fetchone()
         cur.close()
-        return bool(row and row[0])  # return function’s boolean
+        return True  # success if no exception
     except Exception:
         cur.close()
         return False
