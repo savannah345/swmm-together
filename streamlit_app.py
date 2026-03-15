@@ -20,27 +20,30 @@ BUCKET = st.secrets.get("BUCKET_NAME", "project_uploads")
 # Storage client (server-side)
 storage_sb: Client = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
 
+
 def is_project_owner(conn, user_id: str, project_id: str) -> bool:
-    cur = tx(conn, user_id)
+    cur = _cursor(conn)
     try:
+        set_rls_user(cur, user_id)
         qexec(cur, "select public.is_project_owner(%s);", (project_id,))
         row = cur.fetchone()
-        commit(conn, cur)
+        cur.close()
         return bool(row and row[0])
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         return False
 
-def has_project_access(conn, user_id: str, project_id: str) -> bool:
-    cur = tx(conn, user_id)
-    try:
-        qexec(cur, "select public.has_project_access(%s);", (project_id,))
 
+def has_project_access(conn, user_id: str, project_id: str) -> bool:
+    cur = _cursor(conn)
+    try:
+        set_rls_user(cur, user_id)
+        qexec(cur, "select public.has_project_access(%s);", (project_id,))
         row = cur.fetchone()
-        commit(conn, cur)
+        cur.close()
         return bool(row and row[0])
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         return False
 
 
@@ -135,35 +138,48 @@ def bcrypt_hash(password: str) -> str:
 def bcrypt_check(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode(), hashed.encode())
 
+import psycopg
+
 def get_conn():
-    conn = psycopg.connect(DB_URL)
-    # Avoid server-side prepared statements (PgBouncer-friendly)
-    conn.prepare_threshold = 0
-    return conn
+    # Turn OFF server-side prepared statements; keep autocommit for PgBouncer
+    # (If you’re on Supabase 6543 pooled port, this is the correct setting.)
+    return psycopg.connect(
+        st.secrets["SUPABASE_DB_URL"],
+        prepare_threshold=None
+    )
+
+def try_get_conn():
+    """Return a live connection or None; do NOT crash the page."""
+    try:
+        conn = get_conn()
+        conn.autocommit = True
+        return conn
+    except Exception as e:
+        # Show a friendly message and provide the technical type for debugging
+        st.warning("We couldn’t connect to the database right now.")
+        st.caption(f"Technical detail: {type(e).__name__}: {e}")
+        return None
 
 
-def tx(conn, user_id: str | None):
-    cur = conn.cursor()
-    cur.execute("begin;")  # no params => no prepares
-    # set_config IS parameterized: but prepare_threshold=0 prevents prepares globally
-    cur.execute("select set_config('app.user_id', %s, true);", (str(user_id) if user_id else "",))
-    return cur
-
-def commit(conn, cur):
-    conn.commit()
-    cur.close()
-
-def rollback(conn, cur):
-    conn.rollback()
-    cur.close()
-
+def _cursor(conn):
+    # Prefer text protocol to avoid binary/extended behaviors
+    return conn.cursor(binary=False)
 
 def qexec(cur, sql: str, params: tuple | None = None):
-    # psycopg3: don't pass prepare keyword; rely on conn.prepare_threshold=0
     return cur.execute(sql, params or ())
 
 def qexecmany(cur, sql: str, seq_params: list[tuple]):
-    return cur.executemany(sql, seq_params)
+    # Avoid executemany (can lead to implicit prepares)
+    for p in seq_params:
+        cur.execute(sql, p)
+
+def set_rls_user(cur, user_id: str | None):
+    """
+    Set app.user_id RLS context at the *session* level (is_local=false)
+    so we don't need transactions. PgBouncer-safe.
+    """
+    uid = str(user_id) if user_id else ""
+    cur.execute("select set_config('app.user_id', %s, false);", (uid,))
 
 
 import mimetypes
@@ -192,133 +208,131 @@ def detect_content_type(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 def supabase_upload_bytes(bucket: str, path: str, filename: str, data: bytes, upsert: bool = True):
-    """
-    Uploads bytes to Supabase Storage with header-safe options.
-    - Ensures header values are strings.
-    - Adds a reasonable contentType.
-    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("Upload data must be bytes.")
+    ct = detect_content_type(filename) or "application/octet-stream"
     options = {
-        "contentType": detect_content_type(filename),
-        "cacheControl": "3600",  # must be string
-        "upsert": "true" if upsert else "false",  # convert bool -> string
+        "contentType": ct,
+        "cacheControl": "3600",
+        "upsert": "true" if upsert else "false",
     }
     return storage_sb.storage.from_(bucket).upload(path, data, options)
-
 # =========================
 # Auth via SECURITY DEFINER RPCs (RLS-safe)
 # =========================
+
 def rpc_lookup_user_for_login(conn, email: str):
     email = email.strip().lower()
-    cur = tx(conn, None)
+    cur = _cursor(conn)
     try:
+        set_rls_user(cur, None)  # not authenticated yet
         qexec(cur, "select user_id, bcrypt_hash from public.lookup_user_for_login(%s);", (email,))
         row = cur.fetchone()
-        commit(conn, cur)
-        return row  # (uuid, hash) or None
+        cur.close()
+        return row
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
 def rpc_create_user(conn, email: str, password: str) -> bool:
     email = email.strip().lower()
     h = bcrypt_hash(password)
-    cur = tx(conn, None)
+    cur = _cursor(conn)
     try:
-
+        set_rls_user(cur, None)
         qexec(cur, "select public.create_user(%s, %s);", (email, h))
-
-        commit(conn, cur)
+        cur.close()
         return True
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         return False
 
 def rpc_change_password(conn, user_id: str, new_password: str) -> bool:
     h = bcrypt_hash(new_password)
-    cur = tx(conn, user_id)
+    cur = _cursor(conn)
     try:
-
+        set_rls_user(cur, user_id)
         qexec(cur, "select public.change_password(%s);", (h,))
-
-        commit(conn, cur)
+        cur.close()
         return True
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         return False
+
 
 # =========================
 # DB ops (all RLS enforced)
 # =========================
-def db_list_projects(conn, user_id: str):
-    cur = tx(conn, user_id)
-    try:
 
+def db_list_projects(conn, user_id: str):
+    cur = _cursor(conn)
+    try:
+        set_rls_user(cur, user_id)
         qexec(cur, """
             select id, project_name_id, project_title, deletable_after, created_at, updated_at
             from public.projects
             order by created_at desc;
         """)
-
         rows = cur.fetchall()
-        commit(conn, cur)
+        cur.close()
         return rows
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
-def db_create_project(conn, user_id: str, project_name_id: str, title: str | None):
-    cur = tx(conn, user_id)
-    try:
 
+def db_create_project(conn, user_id: str, project_name_id: str, title: str | None):
+    cur = _cursor(conn)
+    try:
+        set_rls_user(cur, user_id)
         qexec(cur, """
             insert into public.projects (user_id, project_name_id, project_title)
             values (%s, %s, %s)
             returning id;
         """, (user_id, project_name_id, title))
-
         pid = cur.fetchone()[0]
-        commit(conn, cur)
+        cur.close()
         return str(pid)
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
 def db_set_deletable_after(conn, user_id: str, project_id: str, deletable_after: datetime | None):
-    cur = tx(conn, user_id)
+    cur = _cursor(conn)
     try:
-
+        set_rls_user(cur, user_id)
         qexec(cur, """
             update public.projects
             set deletable_after = %s
             where id = %s;
         """, (deletable_after, project_id))
-
-        commit(conn, cur)
+        cur.close()
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
-def db_get_current_file(conn, user_id: str, project_id: str):
-    cur = tx(conn, user_id)
-    try:
 
+
+def db_get_current_file(conn, user_id: str, project_id: str):
+    cur = _cursor(conn)
+    try:
+        set_rls_user(cur, user_id)
         qexec(cur, """
             select id, storage_path, original_filename, updated_at
             from public.project_files
             where project_id = %s;
         """, (project_id,))
-
         row = cur.fetchone()
-        commit(conn, cur)
+        cur.close()
         return row
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
 def db_upsert_current_file(conn, user_id: str, project_id: str, storage_path: str, original_filename: str):
-    cur = tx(conn, user_id)
+    cur = _cursor(conn)
     try:
-
+        set_rls_user(cur, user_id)
         qexec(cur, """
             insert into public.project_files (user_id, project_id, storage_path, original_filename)
             values (%s, %s, %s, %s)
@@ -326,96 +340,95 @@ def db_upsert_current_file(conn, user_id: str, project_id: str, storage_path: st
             do update set storage_path = excluded.storage_path,
                         original_filename = excluded.original_filename;
         """, (user_id, project_id, storage_path, original_filename))
-
-        commit(conn, cur)
+        cur.close()
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
-def db_delete_current_file_row(conn, user_id: str, project_id: str):
-    cur = tx(conn, user_id)
-    try:
 
+def db_delete_current_file_row(conn, user_id: str, project_id: str):
+    cur = _cursor(conn)
+    try:
+        set_rls_user(cur, user_id)
         qexec(cur, """
             delete from public.project_files
             where project_id = %s
             returning storage_path;
         """, (project_id,))
-
         row = cur.fetchone()
-        commit(conn, cur)
+        cur.close()
         return row[0] if row else None
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
 def db_rename_project_name_id(conn, user_id: str, project_id: str, new_name_id: str):
-    cur = tx(conn, user_id)
+    cur = _cursor(conn)
     try:
-
+        set_rls_user(cur, user_id)
         qexec(cur, """
             update public.projects
             set project_name_id = %s
             where id = %s;
         """, (new_name_id, project_id))
-
-        commit(conn, cur)
+        cur.close()
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
+
 
 # =========================
 # DB ops: spatial layers, LID caps, uncertainty
 # =========================
-def db_upsert_spatial_layer(conn, user_id: str, project_id: str, layer_type: str, storage_path: str, original_filename: str):
-    cur = tx(conn, user_id)
-    try:
 
-        qexec(cur, """
-            delete from public.project_spatial_layers
-            where project_id = %s and layer_type = %s;
-        """, (project_id, layer_type))
+def db_upsert_spatial_layer(conn, user_id: str, project_id: str, layer_type: str, storage_path: str, original_filename: str):
+    cur = _cursor(conn)
+    try:
+        set_rls_user(cur, user_id)
+        qexec(cur, "delete from public.project_spatial_layers where project_id = %s and layer_type = %s;", (project_id, layer_type))
         qexec(cur, """
             insert into public.project_spatial_layers (user_id, project_id, layer_type, storage_path, original_filename)
             values (%s, %s, %s, %s, %s);
         """, (user_id, project_id, layer_type, storage_path, original_filename))
-        commit(conn, cur)
+        cur.close()
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
 def db_replace_lid_caps(conn, user_id: str, project_id: str, rows: list[tuple[str, str, float]]):
-    """
-    rows: [(subcatchment_id, lid_type, max_value), ...]
-    """
-    cur = tx(conn, user_id)
+    cur = _cursor(conn)
     try:
-
+        set_rls_user(cur, user_id)
         qexec(cur, "delete from public.project_lid_caps where project_id = %s;", (project_id,))
         qexecmany(cur, """
             insert into public.project_lid_caps (user_id, project_id, subcatchment_id, lid_type, max_value)
             values (%s, %s, %s, %s, %s);
         """, [(user_id, project_id, sc, lid, float(mx)) for (sc, lid, mx) in rows])
-
-        commit(conn, cur)
+        cur.close()
     except Exception:
-        rollback(conn, cur)
+        cur.close()
         raise
 
 def db_upsert_uncertainty(conn, user_id: str, project_id: str, q: dict, confidence_class: str):
-    cur = tx(conn, user_id)
+    cur = _cursor(conn)
     try:
-
+        set_rls_user(cur, user_id)
         qexec(cur, """
             insert into public.project_uncertainty
-            (project_id, user_id, calibrated_to_gage, validated_events, input_resolution, network_source, confidence_self, notes, confidence_class)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (project_id, user_id,
+             calibrated_to_gage, validated_events, input_resolution, network_source,
+             confidence_self, percent_uncertainty, notes, confidence_class)
+            values
+            (%s, %s,
+             %s, %s, %s, %s,
+             %s, %s, %s, %s)
             on conflict (project_id) do update
             set calibrated_to_gage = excluded.calibrated_to_gage,
                 validated_events   = excluded.validated_events,
                 input_resolution   = excluded.input_resolution,
                 network_source     = excluded.network_source,
                 confidence_self    = excluded.confidence_self,
+                percent_uncertainty= excluded.percent_uncertainty,
                 notes              = excluded.notes,
                 confidence_class   = excluded.confidence_class,
                 updated_at         = now();
@@ -426,13 +439,13 @@ def db_upsert_uncertainty(conn, user_id: str, project_id: str, q: dict, confiden
             normalize_resolution(q.get("input_resolution")),
             normalize_network_source(q.get("network_source")),
             normalize_confidence(q.get("confidence_self")),
+            float(q.get("percent_uncertainty") or 0.0),  # 👉 NEW param
             q.get("notes") or "",
             confidence_class
         ))
-
-        commit(conn, cur)
+        cur.close()
     except Exception as e:
-        rollback(conn, cur)
+        cur.close()
         raise e
 
 # =========================
@@ -533,8 +546,12 @@ def app_ui(user_id: str, email: str):
 
     st.title("Your Projects (.inp)")
 
-    conn = get_conn()
+    conn = None
     try:
+        conn = try_get_conn()
+        if conn is None:
+            # We already surfaced a warning in try_get_conn(); stop rendering
+            return
         # Create project
         with st.expander("Create project", expanded=True):
             raw_name = st.text_input("Project ID", placeholder="e.g. HavenCreek_Watershed_01")
@@ -830,10 +847,7 @@ def app_ui(user_id: str, email: str):
         with st.form("uncertainty_form", clear_on_submit=False):
             c_gage   = st.checkbox("Calibrated to at least one gage?")
             v_events = st.number_input("Number of validated events", min_value=0, max_value=1000, step=1, value=0)
-            input_res = st.selectbox(
-                "Input resolution",
-                ["Low", "Moderate", "High"])
-
+            input_res = st.selectbox("Input resolution", ["Low", "Moderate", "High"])
             with st.popover("What do Low / Moderate / High mean?"):
                 st.markdown("""
             **Low**  
@@ -845,16 +859,13 @@ def app_ui(user_id: str, email: str):
             - Planning-grade inputs (1–10 m land cover, 1–3 m DEM)  
             - Good for watershed screening and comparison
 
-
             **High**  
             - High-resolution inputs (<1 m LiDAR DEM)  
             - Detailed land use & surveyed impervious datasets  
             - Suitable for design-grade assessments
             """)
 
-            # Network source select + popover
             net_src = st.selectbox("Stormwater network source", ["As Built", "Legacy GIS", "Partial", "Mixed"])
-
             with st.popover("What do the network source options mean?"):
                 st.markdown("""
             **As Built**  
@@ -872,8 +883,12 @@ def app_ui(user_id: str, email: str):
             **Mixed**  
             - Combination of the above; quality varies across the system
             """)
-
-            conf_self = st.selectbox("Your confidence (self-rating)", ["Low", "Moderate", "High"])
+            conf_self = st.selectbox("Your confidence (self-rating)", ["Low", "Moderate", "High"])           
+            percent_uncertainty = st.number_input(
+                "Model-estimated flooding uncertainty (%)",
+                min_value=0.0, max_value=100.0, step=0.1, value=0.0,
+                help="Enter a single percentage representing your model’s estimated flooding uncertainty."
+            )            
             notes = st.text_area("Notes / metadata (optional)", placeholder="e.g., validated on Hurricane Irene (2011); high-res land use")
 
             submitted = st.form_submit_button("Save Uncertainty")
@@ -889,19 +904,19 @@ def app_ui(user_id: str, email: str):
                             "input_resolution": input_res,
                             "network_source": net_src,
                             "confidence_self": conf_self,
-                            "notes": notes,
+                            "percent_uncertainty": percent_uncertainty,
+                            "notes": notes
                         }
                         cclass = classify_confidence(q)
                         db_upsert_uncertainty(conn, user_id, project_id, q, cclass)
                         st.success(f"Saved. Confidence class: **{cclass.capitalize()}**")
-                        st.info("This badge will drive default uncertainty bands (Low ±10%, Moderate ±15%, High ±20%).")
                     except Exception as e:
                         st.error(str(e))
     
+
     finally:
-        conn.close()
-
-
+        if conn is not None:  
+            conn.close()
 
 # =========================
 # Main
