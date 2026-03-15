@@ -499,9 +499,12 @@ def auth_ui():
             finally:
                 conn.close()
 
-            st.success("Account created. Now log in.") if ok else st.error(
-                "Could not create account (email may already exist)."
-            )
+
+            if ok:
+                st.success("Account created. Now log in.")
+            else:
+                st.error("Could not create account (email may already exist).")
+
 
     with tabs[2]:
         st.caption("No email reset. Requires current password.")
@@ -530,7 +533,10 @@ def auth_ui():
                     return
 
                 ok = rpc_change_password(conn, str(user_id), new_pw1)
-                st.success("Password changed.") if ok else st.error("Could not change password.")
+                if ok:
+                    st.success("Password changed.")
+                else:
+                    st.error("Could not change password.")
             finally:
                 conn.close()
 
