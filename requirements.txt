@@ -1,3 +1,16 @@
-streamlit
-pandas>=2.0
-openpyxl>=3.1
+# --- Core app UI ---
+streamlit>=1.32.0
+
+# --- Database connectivity (psycopg3) ---
+# Use the prebuilt binary wheel to avoid compiling C locally
+psycopg[binary]>=3.1.18
+
+# --- Auth / hashing ---
+bcrypt>=4.1.2
+
+# --- Data handling (CSV/Excel) ---
+pandas>=2.2.1
+openpyxl>=3.1.2   # for .xlsx
+xlrd>=2.0.1       # for .xls
+
+# --- Supabase client (v2) ---
